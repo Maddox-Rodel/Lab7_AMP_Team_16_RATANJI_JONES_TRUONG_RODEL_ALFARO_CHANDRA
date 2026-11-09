@@ -68,39 +68,28 @@ __error__(char *pcFilename, uint32_t ui32Line)
 //                    front < 8 cm  -> stop, U-turn status = 1, U-turn
 //                    U-turning and front < 14 cm -> keep U-turning
 //                    U-turning and front >= 14 cm -> forward, status = 0
-//                    otherwise -> trigger the RIGHT sensor (ADC0 SS1)
-//   RIGHT ISR (SS1): wheel-to-wall > 15 cm (2 readings in a row) -> Right Turn
+//                    right-turn sequence running -> step it (RightTurnSequence)
+//                    then trigger the RIGHT sensor (ADC0 SS1)
+//   RIGHT ISR (SS1): sequence running -> only store the reading
+//                    wheel-to-wall > 15 cm (2 readings in a row) -> start sequence
 //                    else -> PID
 //   STR: motors forward at base speed, Running = true
 //   STP: Running = false, motors off, LED off
 //   LIV: live readout of both sensors + mode, on/off
 //
-// SMOOTH: changes for straighter, gentler wall following
-//   1. PID gains tuned for this robot + capped correction
-//   2. Deadband: tiny errors (sensor noise) are ignored
-//   3. Ramp: the correction changes at most MAX_STEP_PCT per reading
-//   4. Low-pass filter on the right wheel distance (removes sensor jitter)
-//   5. PidReset() clears all PID state after STR, a U-turn or a right turn
-//   6. Intersection needs 2 far readings in a row (one noisy spike won't turn)
-//   7. Motor trim + TEST_MODE 3 to make the robot drive straight on its own
-//
-// LIVE: LIV command prints Wheel / Right / Front / Mode every 200 ms
-//
-// TUNE: changes after the first LIV log (robot weaved like a snake)
-//   1. Sensor is at the wheel edge -> SENSOR_TO_WHEEL_CM = 0
-//   2. TARGET_CM = 10 (sensor's reliable range starts at ~10 cm)
-//   3. Stronger P (KP 3), bigger max correction (20%), faster ramp (4%)
-//   4. D now compares with the error 150 ms ago (5 readings), so it can
-//      actually damp the weave; KD = 8
-//   5. FILTER_ALPHA 0.6 for a little less lag
+// TURN: timed right-turn sequence (all BLUE LED)
+//   RT-WAIT     drive straight RTURN_DELAY_BEFORE_MS (0.5 s) past the opening
+//   RT-TURN     pivot right for RTURN_TURN_MS (tune this for 90 degrees)
+//   RT-STRAIGHT drive straight RTURN_DELAY_AFTER_MS (0.5 s), right sensor ignored
+//   then back to PID with a fresh start (PidReset)
 //
 //*****************************************************************************
 #include "driverlib/pwm.h"      // PWMGenConfigure(), PWMPulseWidthSet(), PWMOutputState()
 #include "driverlib/timer.h"    // TimerConfigure(), TimerLoadSet(), TimerEnable()
 
 //*****************************************************************************
-// [TEST] Steps 3 and 4: 1 = Right Turn alone (drives in a circle),
-// 2 = U-Turn alone (spins in place), 3 = straight line (motor trim test).
+// [TEST] 1 = pivot alone (spins right, for tuning turn speeds),
+// 2 = U-Turn alone (spins left), 3 = straight line (motor trim test).
 // Don't type STR while testing. Set back to 0 for the maze.
 //*****************************************************************************
 #define TEST_MODE           0
@@ -124,10 +113,10 @@ __error__(char *pcFilename, uint32_t ui32Line)
 // [WALL] Distances (all in cm) -- tune these in the maze
 //   wheel distance = right sensor distance - SENSOR_TO_WHEEL_CM
 //*****************************************************************************
-#define TARGET_CM           10.0f   // TUNE: right wheel 10 cm from the wall (was 4)
-#define SENSOR_TO_WHEEL_CM  0.0f    // TUNE: sensor is at the edge of the wheel (was 4)
-#define INTERSECTION_CM     15.0f   // wheel-to-wall above this = intersection -> right turn
-#define INTERSECTION_COUNT  2       // far readings in a row needed before turning
+#define TARGET_CM           10.0f   // right wheel 10 cm from the wall
+#define SENSOR_TO_WHEEL_CM  0.0f    // sensor is at the edge of the wheel
+#define INTERSECTION_CM     15.0f   // wheel-to-wall above this = opening -> right turn
+#define INTERSECTION_COUNT  2       // far readings in a row needed before starting the turn
 #define FRONT_STOP_CM       8.0f    // front below this -> start U-turn
 #define UTURN_EXIT_CM       14.0f   // U-turn ends once front reaches this
 
@@ -137,15 +126,15 @@ __error__(char *pcFilename, uint32_t ui32Line)
 //   Fast wiggle / jerky   -> lower KD (try 5) or FILTER_ALPHA (try 0.4)
 //   Sits 1-2 cm off target -> set motor trim, or KI 0.05
 //*****************************************************************************
-#define KP                  3.0f    // TUNE: was 1.5 -- % duty per cm of error
+#define KP                  3.0f    // % duty per cm of error
 #define KI                  0.0f
-#define KD                  8.0f    // TUNE: % duty per cm of change over D_WINDOW readings
-#define D_WINDOW            5       // TUNE: D compares with the reading 5 x 30 = 150 ms ago
+#define KD                  8.0f    // % duty per cm of change over D_WINDOW readings
+#define D_WINDOW            5       // D compares with the reading 5 x 30 = 150 ms ago
 #define I_SUM_LIMIT         50.0f   // caps the error sum to avoid integral windup
-#define MAX_ADJUST_PCT      20.0f   // TUNE: was 12 -- largest correction (% duty)
+#define MAX_ADJUST_PCT      20.0f   // largest correction (% duty)
 #define DEADBAND_CM         0.5f    // errors smaller than this count as 0 (P/I only)
-#define MAX_STEP_PCT        4.0f    // TUNE: was 2 -- correction can change this much per reading
-#define FILTER_ALPHA        0.6f    // TUNE: was 0.5 -- 1.0 = no filter, smaller = smoother but slower
+#define MAX_STEP_PCT        4.0f    // correction can change this much per reading
+#define FILTER_ALPHA        0.6f    // 1.0 = no filter, smaller = smoother but slower
 
 //*****************************************************************************
 // [MOTOR] PWM
@@ -165,9 +154,15 @@ __error__(char *pcFilename, uint32_t ui32Line)
 #define RIGHT_TRIM_PCT      0.0f
 
 // Turn speeds -- tune so the turns fit the maze
-#define RTURN_LEFT_PCT      50.0f   // right turn: left (outer) wheel fast
-#define RTURN_RIGHT_PCT     15.0f   //             right (inner) wheel slow
+#define RTURN_LEFT_PCT      45.0f   // right turn: left (outer) wheel forward
+#define RTURN_RIGHT_PCT     20.0f   //             right (inner) wheel speed
+#define RTURN_RIGHT_REVERSE 1       // 1 = inner wheel runs BACKWARD (tight pivot), 0 = forward
 #define UTURN_PCT           50.0f   // U-turn: both wheels, opposite directions
+
+// TURN: timing of the right-turn sequence (ms)
+#define RTURN_DELAY_BEFORE_MS  500  // TURN: straight past the opening before turning
+#define RTURN_TURN_MS          800  // TURN: pivot time -- tune until it turns 90 degrees
+#define RTURN_DELAY_AFTER_MS   500  // TURN: straight after turning, right sensor ignored
 
 #define LEFT_PHASE_FWD      0       // PA2 level for forward
 #define RIGHT_PHASE_FWD     1       // PA3 level for forward (right motor is mirrored)
@@ -177,6 +172,12 @@ __error__(char *pcFilename, uint32_t ui32Line)
 #define LED_RED     (GPIO_PIN_1)
 #define LED_BLUE    (GPIO_PIN_2)
 #define LED_GREEN   (GPIO_PIN_3)
+
+// TURN: right-turn sequence states
+#define RT_IDLE     0               // not turning: PID in control
+#define RT_BEFORE   1               // straight, waiting to turn
+#define RT_TURN     2               // pivoting right
+#define RT_AFTER    3               // straight, right sensor ignored
 
 //*****************************************************************************
 // [GLOBALS] volatile because ISRs write them and other code reads them
@@ -190,11 +191,13 @@ volatile float ErrPrev = 0.0f;          // PID: previous error
 volatile float FiltWheel = 0.0f;        // filtered wheel distance used by the PID
 volatile float AdjPrev   = 0.0f;        // last correction (for the ramp)
 volatile bool  PidFirst  = true;        // next PID call seeds the filter + history
-volatile float   ErrHist[D_WINDOW];     // TUNE: past errors, for the D term
-volatile uint8_t HistIdx = 0;           // TUNE: next slot in ErrHist
-volatile uint8_t FarCount        = 0;   // far readings in a row (intersection check)
+volatile float   ErrHist[D_WINDOW];     // past errors, for the D term
+volatile uint8_t HistIdx = 0;           // next slot in ErrHist
+volatile uint8_t FarCount        = 0;   // far readings in a row (opening check)
 volatile uint8_t UTurnStatus     = 0;   // 1 while U-turning
-volatile uint8_t RightTurnStatus = 0;   // 1 while turning right
+volatile uint8_t RightTurnStatus = 0;   // 1 while the right-turn sequence runs
+volatile uint8_t  RTState  = RT_IDLE;   // TURN: current step of the right-turn sequence
+volatile uint32_t RTTimeMs = 0;         // TURN: time spent in the current step
 volatile bool     Streaming = false;    // LIVE: true while LIV printing is on
 volatile uint32_t TickCount = 0;        // LIVE: counts timer ticks, paces the printing
 uint32_t PWMPeriod = 0;                 // PWM clocks per period, set in PWM_init()
@@ -323,6 +326,14 @@ SetDirection(bool bLeftFwd, bool bRightFwd)
                  (ui8Right ? GPIO_PIN_3 : 0));
 }
 
+// TURN: both wheels forward at the base speed (used by the turn delays)
+void
+DriveStraight(void)
+{
+    SetDirection(true, true);
+    SetMotors(BASE_DUTY_PCT, BASE_DUTY_PCT);
+}
+
 //*****************************************************************************
 // [MOTOR] PWM_init: motor driver pins. Outputs stay OFF until STR.
 //*****************************************************************************
@@ -376,8 +387,8 @@ Timer_init(void)
 }
 
 //*****************************************************************************
-// [ISR] Timer 2A: trigger the FRONT sensor. The front ISR decides whether
-// the right sensor gets read.
+// [ISR] Timer 2A: trigger the FRONT sensor. The front ISR decides what
+// happens next.
 //*****************************************************************************
 void
 Timer2AIntHandler(void)
@@ -468,7 +479,7 @@ PID(float fWheel)
 
     fRaw = TARGET_CM - FiltWheel;       // > 0 too close, < 0 too far
 
-    // TUNE: first call after a reset -- fill the history so D starts at 0
+    // First call after a reset: fill the history so D starts at 0
     if(PidFirst)
     {
         for(k = 0; k < D_WINDOW; k++) ErrHist[k] = fRaw;
@@ -476,8 +487,7 @@ PID(float fWheel)
         PidFirst = false;
     }
 
-    // TUNE: D compares with the error from D_WINDOW readings ago (150 ms),
-    // so slow drifts toward/away from the wall are big enough to matter.
+    // D compares with the error from D_WINDOW readings ago (150 ms).
     // Uses the error before the deadband, so D stays smooth.
     fOld = ErrHist[HistIdx];
     ErrHist[HistIdx] = fRaw;
@@ -508,15 +518,88 @@ PID(float fWheel)
 }
 
 //*****************************************************************************
-// [TURN] Step 3: Right Turn -- both wheels forward, left faster. BLUE LED.
-// Tune RTURN_LEFT_PCT / RTURN_RIGHT_PCT so the arc fits the maze.
+// [TURN] Step 3: Right Turn pivot -- left wheel forward, right wheel slow
+// (or backward when RTURN_RIGHT_REVERSE = 1 for a tighter turn). BLUE LED.
+// Only sets direction + speed. RightTurnSequence() decides how long.
 //*****************************************************************************
 void
 RightTurn(void)
 {
     GPIOPinWrite(GPIO_PORTF_BASE, LED_ALL, LED_BLUE);
-    SetDirection(true, true);
+    SetDirection(true, !RTURN_RIGHT_REVERSE);   // right wheel backward if REVERSE = 1
     SetMotors(RTURN_LEFT_PCT, RTURN_RIGHT_PCT);
+}
+
+//*****************************************************************************
+// TURN: RightTurnStart -- called once when the right sensor sees an opening.
+// Starts the sequence with the straight "before" delay. BLUE LED.
+//*****************************************************************************
+void
+RightTurnStart(void)
+{
+    RightTurnStatus = 1;
+    RTState  = RT_BEFORE;
+    RTTimeMs = 0;
+    GPIOPinWrite(GPIO_PORTF_BASE, LED_ALL, LED_BLUE);
+    DriveStraight();
+}
+
+//*****************************************************************************
+// TURN: RightTurnSequence -- called every 30 ms (from the front ISR) while
+// the sequence runs. Moves to the next step when the current one's time
+// is up:
+//   RT_BEFORE (0.5 s straight) -> RT_TURN (pivot RTURN_TURN_MS)
+//   -> RT_AFTER (0.5 s straight) -> RT_IDLE (PID takes over again)
+//*****************************************************************************
+void
+RightTurnSequence(void)
+{
+    RTTimeMs += SAMPLE_PERIOD_MS;
+
+    switch(RTState)
+    {
+        case RT_BEFORE:                         // straight past the opening
+            if(RTTimeMs >= RTURN_DELAY_BEFORE_MS)
+            {
+                RTState  = RT_TURN;
+                RTTimeMs = 0;
+                RightTurn();                    // start the pivot
+            }
+            break;
+
+        case RT_TURN:                           // pivoting right
+            if(RTTimeMs >= RTURN_TURN_MS)
+            {
+                RTState  = RT_AFTER;
+                RTTimeMs = 0;
+                DriveStraight();                // right wheel forward again
+            }
+            break;
+
+        case RT_AFTER:                          // straight, right sensor ignored
+            if(RTTimeMs >= RTURN_DELAY_AFTER_MS)
+            {
+                RTState         = RT_IDLE;      // done: PID takes over
+                RightTurnStatus = 0;
+                FarCount        = 0;
+                PidReset();
+            }
+            break;
+
+        default:
+            RTState = RT_IDLE;
+            break;
+    }
+}
+
+// TURN: stop the sequence right away (U-turn, STR, STP)
+void
+RightTurnCancel(void)
+{
+    RTState         = RT_IDLE;
+    RTTimeMs        = 0;
+    RightTurnStatus = 0;
+    FarCount        = 0;
 }
 
 //*****************************************************************************
@@ -552,10 +635,16 @@ ADC0Seq2IntHandler(void)
         return;
     }
 
-    if(FrontDistanceCm < FRONT_STOP_CM)
+    // TURN: while pivoting, the front sensor sweeps across nearby walls, so
+    // the U-turn check is skipped during RT_TURN only.
+    if((FrontDistanceCm < FRONT_STOP_CM) && (RTState != RT_TURN))
     {
         // Wall ahead: stop, set U-turn status, start the U-turn
-        if(UTurnStatus == 0) SetMotors(0.0f, 0.0f);
+        if(UTurnStatus == 0)
+        {
+            SetMotors(0.0f, 0.0f);
+            RightTurnCancel();          // TURN: a U-turn overrides the right turn
+        }
         UTurnStatus = 1;
         UTurn();
     }
@@ -567,23 +656,24 @@ ADC0Seq2IntHandler(void)
     else if(UTurnStatus == 1)
     {
         // U-turn finished: both wheels forward at the default speed
-        SetDirection(true, true);
-        SetMotors(BASE_DUTY_PCT, BASE_DUTY_PCT);
-        UTurnStatus     = 0;
-        RightTurnStatus = 0;
-        FarCount        = 0;
+        DriveStraight();
+        UTurnStatus = 0;
+        RightTurnCancel();
         PidReset();                     // fresh PID after the U-turn
     }
     else
     {
-        // Path ahead is clear: read the right sensor
+        // TURN: advance the right-turn sequence if it is running
+        if(RTState != RT_IDLE) RightTurnSequence();
+
+        // Read the right sensor (used by the PID, or just shown by LIV during a turn)
         ADCProcessorTrigger(ADC0_BASE, ADC_SEQ_RIGHT);
     }
 }
 
 //*****************************************************************************
 // [ISR] ADC0 SS1 -- RIGHT sensor ready (triggered by the front ISR)
-// Only calculates the distance and picks Right Turn or PID.
+// Calculates the distance, then starts the turn sequence or runs the PID.
 //*****************************************************************************
 void
 ADC0Seq1IntHandler(void)
@@ -602,6 +692,10 @@ ADC0Seq1IntHandler(void)
 
     if(!Running || UTurnStatus) return;
 
+    // TURN: the sequence owns the motors until it finishes -- the right
+    // sensor can't interrupt it (this is what stops the half-turns)
+    if(RTState != RT_IDLE) return;
+
     // Count far readings in a row, so one noisy spike can't start a turn
     if(fWheel > INTERSECTION_CM)
     {
@@ -614,18 +708,10 @@ ADC0Seq1IntHandler(void)
 
     if(FarCount >= INTERSECTION_COUNT)
     {
-        // No wall on the right: intersection -> turn right
-        RightTurnStatus = 1;
-        RightTurn();
+        RightTurnStart();               // TURN: opening found -> start the timed sequence
     }
     else
     {
-        // Wall found again after a turn: restart the PID cleanly
-        if(RightTurnStatus)
-        {
-            RightTurnStatus = 0;
-            PidReset();
-        }
         PID(fWheel);
     }
 }
@@ -639,11 +725,9 @@ void
 CmdStart(void)
 {
     PidReset();
-    UTurnStatus     = 0;
-    RightTurnStatus = 0;
-    FarCount        = 0;
-    SetDirection(true, true);
-    SetMotors(BASE_DUTY_PCT, BASE_DUTY_PCT);
+    UTurnStatus = 0;
+    RightTurnCancel();                  // TURN
+    DriveStraight();
     Running = true;
     UARTSendBoth("\r\nSTR: Start -- navigating the maze\r\n");
 }
@@ -656,9 +740,8 @@ CmdStop(void)
     Running = false;
     SetMotors(0.0f, 0.0f);
     SetDirection(true, true);
-    UTurnStatus     = 0;
-    RightTurnStatus = 0;
-    FarCount        = 0;
+    UTurnStatus = 0;
+    RightTurnCancel();                  // TURN
     GPIOPinWrite(GPIO_PORTF_BASE, LED_ALL, 0);
     UARTSendBoth("\r\nSTP: Stop the robot\r\n");
 }
@@ -693,8 +776,7 @@ CmdDistance(void)
 //*****************************************************************************
 // LIVE: print one line with both sensors and the current mode.
 // Called from main() only (UARTSendBoth blocks, so never from an ISR).
-//   Wheel = right wheel to wall, Right = right sensor to wall,
-//   Front = front sensor to wall, Mode = STOP / PID / RTURN / UTURN
+//   Mode = STOP / PID / UTURN / RT-WAIT / RT-TURN / RT-STRAIGHT
 //*****************************************************************************
 void
 PrintLive(void)
@@ -707,11 +789,13 @@ PrintLive(void)
     strcat(Msg, " cm, Front = ");
     AppendCm(Msg, FrontDistanceCm);
     strcat(Msg, " cm, Mode = ");
- 
-    if(!Running)              strcat(Msg, "STOP");
-    else if(UTurnStatus)      strcat(Msg, "UTURN");
-    else if(RightTurnStatus)  strcat(Msg, "RTURN");
-    else                      strcat(Msg, "PID");
+
+    if(!Running)                    strcat(Msg, "STOP");
+    else if(UTurnStatus)            strcat(Msg, "UTURN");
+    else if(RTState == RT_BEFORE)   strcat(Msg, "RT-WAIT");       // TURN
+    else if(RTState == RT_TURN)     strcat(Msg, "RT-TURN");       // TURN
+    else if(RTState == RT_AFTER)    strcat(Msg, "RT-STRAIGHT");   // TURN
+    else                            strcat(Msg, "PID");
 
     UARTSendBoth(Msg);
 }
@@ -752,7 +836,7 @@ CmdHelp(void)
 //*****************************************************************************
 int
 main(void)
-{
+ c{
     uint32_t i;
 
     // FPU on before any float math (distance formula + PID in the ADC ISRs)
@@ -808,12 +892,11 @@ main(void)
     {
         // ===================== TEST HOOK (steps 3, 4 + trim) =====================
 #if TEST_MODE == 1
-        RightTurn();                    // should drive in a circle (open area)
+        RightTurn();                    // pivots right continuously (tune turn speeds)
 #elif TEST_MODE == 2
         UTurn();                        // should spin in place
 #elif TEST_MODE == 3
-        SetDirection(true, true);       // both wheels same duty -> should go straight
-        SetMotors(BASE_DUTY_PCT, BASE_DUTY_PCT);
+        DriveStraight();                // both wheels same duty -> should go straight
 #endif
         // =========================================================================
 
