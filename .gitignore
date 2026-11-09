@@ -1,0 +1,17 @@
+*.launch
+*.bin
+*.out
+*.xml
+*.mk
+*.obj
+*.map
+*.d
+*.prefs
+makefile
+*.opt
+*.cmd
+.cproject
+.ccsproject
+macros.ini_initial
+.project
+*.ccxml
