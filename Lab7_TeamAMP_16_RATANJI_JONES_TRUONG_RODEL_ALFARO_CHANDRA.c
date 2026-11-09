@@ -432,6 +432,7 @@ CmdStart(void)
     SetMotors(BASE_DUTY_PCT, BASE_DUTY_PCT);
     TimerEnable(TIMER2_BASE, TIMER_A);
     UARTSendBoth("\r\nSTR: Start -- following the right wall\r\n");
+    
 }
 
 // STP: timer off, motors off, LED off
