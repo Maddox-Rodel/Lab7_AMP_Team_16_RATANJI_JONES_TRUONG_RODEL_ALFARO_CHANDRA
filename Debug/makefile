@@ -10,7 +10,7 @@ GEN_OPTS__FLAG :=
 GEN_CMDS__FLAG := 
 
 ORDERED_OBJS += \
-"./Lab6_TeamAMP_16_RATANJI_JONES_TRUONG_RODEL_ALFARO_CHANDRA.obj" \
+"./Lab7_TeamAMP_16_RATANJI_JONES_TRUONG_RODEL_ALFARO_CHANDRA.obj" \
 "./startup_ccs.obj" \
 "../uart_echo_ccs.cmd" \
 $(GEN_CMDS__FLAG) \
@@ -156,8 +156,8 @@ Lab7_TeamAMP_16_RATANJI_JONES_TRUONG_RODEL_ALFARO_CHANDRA.bin: $(EXE_OUTPUTS)
 # Other Targets
 clean:
 	-$(RM) $(EXE_OUTPUTS__QUOTED)$(BIN_OUTPUTS__QUOTED)
-	-$(RM) "Lab6_TeamAMP_16_RATANJI_JONES_TRUONG_RODEL_ALFARO_CHANDRA.d" "startup_ccs.d" 
-	-$(RM) "Lab6_TeamAMP_16_RATANJI_JONES_TRUONG_RODEL_ALFARO_CHANDRA.obj" "startup_ccs.obj" 
+	-$(RM) "Lab7_TeamAMP_16_RATANJI_JONES_TRUONG_RODEL_ALFARO_CHANDRA.d" "startup_ccs.d" 
+	-$(RM) "Lab7_TeamAMP_16_RATANJI_JONES_TRUONG_RODEL_ALFARO_CHANDRA.obj" "startup_ccs.obj" 
 	-@echo 'Finished clean'
 	-@echo ' '
 

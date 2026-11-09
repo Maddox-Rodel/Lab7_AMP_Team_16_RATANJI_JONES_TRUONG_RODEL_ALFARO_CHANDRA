@@ -61,80 +61,142 @@ __error__(char *pcFilename, uint32_t ui32Line)
 #endif
 //*****************************************************************************
 //
-// LAB 6 -- Right-wall following with PID
+// LAB 7 -- Maze navigation: PID wall following + right turn + U-turn
 //
-//   STR: both motors at 99% duty, start the 50 ms timer        (tasks 3, 5)
-//   Timer 2A ISR (every 50 ms): trigger the distance reading    (task 6)
-//   ADC ISR: right wheel distance -> LED, PID -> motor duty     (tasks 7.1, 7.2)
-//   STP: timer off, motors off, LED off
+//   Timer 2A ISR (every 30 ms, always on): trigger the FRONT sensor (ADC0 SS2)
+//   FRONT ISR (SS2): stopped -> just read the right sensor (for DST/LIV)
+//                    front < 8 cm  -> stop, U-turn status = 1, U-turn
+//                    U-turning and front < 14 cm -> keep U-turning
+//                    U-turning and front >= 14 cm -> forward, status = 0
+//                    otherwise -> trigger the RIGHT sensor (ADC0 SS1)
+//   RIGHT ISR (SS1): wheel-to-wall > 15 cm (2 readings in a row) -> Right Turn
+//                    else -> PID
+//   STR: motors forward at base speed, Running = true
+//   STP: Running = false, motors off, LED off
+//   LIV: live readout of both sensors + mode, on/off
+//
+// SMOOTH: changes for straighter, gentler wall following
+//   1. PID gains tuned for this robot + capped correction
+//   2. Deadband: tiny errors (sensor noise) are ignored
+//   3. Ramp: the correction changes at most MAX_STEP_PCT per reading
+//   4. Low-pass filter on the right wheel distance (removes sensor jitter)
+//   5. PidReset() clears all PID state after STR, a U-turn or a right turn
+//   6. Intersection needs 2 far readings in a row (one noisy spike won't turn)
+//   7. Motor trim + TEST_MODE 3 to make the robot drive straight on its own
+//
+// LIVE: LIV command prints Wheel / Right / Front / Mode every 200 ms
+//
+// TUNE: changes after the first LIV log (robot weaved like a snake)
+//   1. Sensor is at the wheel edge -> SENSOR_TO_WHEEL_CM = 0
+//   2. TARGET_CM = 10 (sensor's reliable range starts at ~10 cm)
+//   3. Stronger P (KP 3), bigger max correction (20%), faster ramp (4%)
+//   4. D now compares with the error 150 ms ago (5 readings), so it can
+//      actually damp the weave; KD = 8
+//   5. FILTER_ALPHA 0.6 for a little less lag
 //
 //*****************************************************************************
-#include "driverlib/pwm.h"      // LAB 6 ADDITION: PWMGenConfigure(), PWMPulseWidthSet(), PWMOutputState()
-#include "driverlib/timer.h"    // LAB 6 ADDITION: TimerConfigure(), TimerLoadSet(), TimerEnable()
+#include "driverlib/pwm.h"      // PWMGenConfigure(), PWMPulseWidthSet(), PWMOutputState()
+#include "driverlib/timer.h"    // TimerConfigure(), TimerLoadSet(), TimerEnable()
 
 //*****************************************************************************
-// [ADC] Distance sensors (task 4)
-//   RIGHT sensor -> PE3 = AIN0 (SS1 steps 0-1), used by the PID
-//   FRONT sensor -> PE2 = AIN1 (SS1 steps 2-3), kept for Lab 7
+// [TEST] Steps 3 and 4: 1 = Right Turn alone (drives in a circle),
+// 2 = U-Turn alone (spins in place), 3 = straight line (motor trim test).
+// Don't type STR while testing. Set back to 0 for the maze.
 //*****************************************************************************
-#define ADC_SEQ             1       // sample sequencer 1 (FIFO holds 4 samples)
-#define ADC_NUM_SAMPLES     4       // total samples per trigger
-#define SAMPLES_PER_SENSOR  2       // 2 right + 2 front
-#define SAMPLE_PERIOD_MS    50      // task 5: 50 ms periodic timer
+#define TEST_MODE           0
 
 //*****************************************************************************
-// LAB 6 ADDITION
-// [WALL] Target distance and LED bands (task 7.1)
-//   wheel distance = sensor distance - SENSOR_TO_WHEEL_CM
+// [ADC] Distance sensors -- each sensor has its own sequencer so the front
+// reading can decide whether to read the right one.
+//   FRONT sensor -> PE2 = AIN1 -> SS2 (triggered by Timer 2A)
+//   RIGHT sensor -> PE3 = AIN0 -> SS1 (triggered by the front ISR)
 //*****************************************************************************
-#define TARGET_CM           10.0f   // right WHEEL 10 cm from the wall
-#define SENSOR_TO_WHEEL_CM  4.0f    // measure on the robot and update
-#define GREEN_BAND_CM       1.0f    // |error| <= 1 cm      -> GREEN
-#define YELLOW_BAND_CM      2.0f    // 1 < |error| <= 2 cm  -> YELLOW, else RED
+#define ADC_SEQ_RIGHT       1       // sample sequencer 1
+#define ADC_SEQ_FRONT       2       // sample sequencer 2
+#define SAMPLES_PER_SENSOR  2       // 2 samples per sensor, averaged
+#define SAMPLE_PERIOD_MS    30      // 30 ms timer (sensor updates every ~38 ms, don't go lower)
+
+// LIVE: print rate for the LIV command (Bluetooth at 9600 baud handles ~5 lines/s easily)
+#define STREAM_PERIOD_MS    200
+#define STREAM_TICKS        (STREAM_PERIOD_MS / SAMPLE_PERIOD_MS)   // timer ticks between prints
 
 //*****************************************************************************
-// LAB 6 ADDITION
-// [PID] Gains (task 7.2, W6C1 slides 14-15). Tune Kp first, then Ki, then Kd.
+// [WALL] Distances (all in cm) -- tune these in the maze
+//   wheel distance = right sensor distance - SENSOR_TO_WHEEL_CM
 //*****************************************************************************
-#define KP                  4.0f
+#define TARGET_CM           10.0f   // TUNE: right wheel 10 cm from the wall (was 4)
+#define SENSOR_TO_WHEEL_CM  0.0f    // TUNE: sensor is at the edge of the wheel (was 4)
+#define INTERSECTION_CM     15.0f   // wheel-to-wall above this = intersection -> right turn
+#define INTERSECTION_COUNT  2       // far readings in a row needed before turning
+#define FRONT_STOP_CM       8.0f    // front below this -> start U-turn
+#define UTURN_EXIT_CM       14.0f   // U-turn ends once front reaches this
+
+//*****************************************************************************
+// [PID] Gains. Errors are in cm, corrections in % duty.
+//   Still snaking slowly  -> raise KD (try 12)
+//   Fast wiggle / jerky   -> lower KD (try 5) or FILTER_ALPHA (try 0.4)
+//   Sits 1-2 cm off target -> set motor trim, or KI 0.05
+//*****************************************************************************
+#define KP                  3.0f    // TUNE: was 1.5 -- % duty per cm of error
 #define KI                  0.0f
-#define KD                  0.0f
+#define KD                  8.0f    // TUNE: % duty per cm of change over D_WINDOW readings
+#define D_WINDOW            5       // TUNE: D compares with the reading 5 x 30 = 150 ms ago
 #define I_SUM_LIMIT         50.0f   // caps the error sum to avoid integral windup
-#define MAX_ADJUST_PCT      40.0f   // largest PID correction (% duty)
+#define MAX_ADJUST_PCT      20.0f   // TUNE: was 12 -- largest correction (% duty)
+#define DEADBAND_CM         0.5f    // errors smaller than this count as 0 (P/I only)
+#define MAX_STEP_PCT        4.0f    // TUNE: was 2 -- correction can change this much per reading
+#define FILTER_ALPHA        0.6f    // TUNE: was 0.5 -- 1.0 = no filter, smaller = smoother but slower
 
 //*****************************************************************************
-// LAB 6 ADDITION
-// [MOTOR] PWM (task 2: Lab 4 PWM moved from the LED to the motors)
+// [MOTOR] PWM
 //   PB6 = M0PWM0 -> DRV8835 AENBL  (left speed)
 //   PB7 = M0PWM1 -> DRV8835 BENBL  (right speed)
 //   PA2          -> DRV8835 APHASE (left direction)
 //   PA3          -> DRV8835 BPHASE (right direction)
 //*****************************************************************************
 #define PWM_FREQ_HZ         10000   // 40 MHz / 10 kHz = 4000 clocks per period
-#define BASE_DUTY_PCT       99.0f   // task 3: as fast as possible
+#define BASE_DUTY_PCT       50.0f   // default forward speed
 #define MAX_DUTY_PCT        99.0f   // pulse width must be less than the period
 #define MIN_DUTY_PCT        0.0f
+
+// Motor trim. If the robot curves in TEST_MODE 3, speed up the slower
+// side (curves right -> right motor slow -> RIGHT_TRIM_PCT 2.0f, etc.)
+#define LEFT_TRIM_PCT       0.0f
+#define RIGHT_TRIM_PCT      0.0f
+
+// Turn speeds -- tune so the turns fit the maze
+#define RTURN_LEFT_PCT      50.0f   // right turn: left (outer) wheel fast
+#define RTURN_RIGHT_PCT     15.0f   //             right (inner) wheel slow
+#define UTURN_PCT           50.0f   // U-turn: both wheels, opposite directions
 
 #define LEFT_PHASE_FWD      0       // PA2 level for forward
 #define RIGHT_PHASE_FWD     1       // PA3 level for forward (right motor is mirrored)
 
-// [LED] PF1 = red, PF2 = blue, PF3 = green; yellow = red + green
+// [LED] PF1 = red, PF2 = blue, PF3 = green
 #define LED_ALL     (GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3)
 #define LED_RED     (GPIO_PIN_1)
+#define LED_BLUE    (GPIO_PIN_2)
 #define LED_GREEN   (GPIO_PIN_3)
-#define LED_YELLOW  (GPIO_PIN_1 | GPIO_PIN_3)
 
 //*****************************************************************************
 // [GLOBALS] volatile because ISRs write them and other code reads them
-// LAB 5 -> LAB 6 EDIT: Lab 5's AdcAverage/DistanceCm replaced by a distance
-// per sensor, the wheel distance, the Running flag and the PID state.
 //*****************************************************************************
 volatile float RightDistanceCm = 0.0f;  // right sensor to wall
-volatile float RightWheelCm    = 0.0f;  // right wheel to wall
-volatile float FrontDistanceCm = 0.0f;  // front sensor to wall (Lab 7)
+volatile float RightWheelCm    = 0.0f;  // right wheel to wall (raw, shown by DST/LIV)
+volatile float FrontDistanceCm = 0.0f;  // front sensor to wall
 volatile bool  Running = false;         // true after STR, false after STP
 volatile float ErrSum  = 0.0f;          // PID: sum of past errors (I term)
-volatile float ErrPrev = 0.0f;          // PID: previous error (D term)
+volatile float ErrPrev = 0.0f;          // PID: previous error
+volatile float FiltWheel = 0.0f;        // filtered wheel distance used by the PID
+volatile float AdjPrev   = 0.0f;        // last correction (for the ramp)
+volatile bool  PidFirst  = true;        // next PID call seeds the filter + history
+volatile float   ErrHist[D_WINDOW];     // TUNE: past errors, for the D term
+volatile uint8_t HistIdx = 0;           // TUNE: next slot in ErrHist
+volatile uint8_t FarCount        = 0;   // far readings in a row (intersection check)
+volatile uint8_t UTurnStatus     = 0;   // 1 while U-turning
+volatile uint8_t RightTurnStatus = 0;   // 1 while turning right
+volatile bool     Streaming = false;    // LIVE: true while LIV printing is on
+volatile uint32_t TickCount = 0;        // LIVE: counts timer ticks, paces the printing
 uint32_t PWMPeriod = 0;                 // PWM clocks per period, set in PWM_init()
 
 // Lab 3 command buffer: filled by UART1IntHandler, read by main
@@ -156,11 +218,9 @@ typedef struct
 void
 UART0IntHandler(void)
 {
-    // Clear the active interrupts so the handler doesn't re-enter immediately
     uint32_t ui32Status = ROM_UARTIntStatus(UART0_BASE, true);
     ROM_UARTIntClear(UART0_BASE, ui32Status);
 
-    // Empty the receive FIFO
     while(ROM_UARTCharsAvail(UART0_BASE))
     {
         uint8_t ui8Char = ROM_UARTCharGetNonBlocking(UART0_BASE);
@@ -214,7 +274,6 @@ UARTSendBoth(const char *pcString)
 }
 
 //*****************************************************************************
-// LAB 6 ADDITION
 // [MOTOR] Set one motor's duty cycle in %. Clamped to 0-99%; 0% turns the
 // output off completely.
 //*****************************************************************************
@@ -230,7 +289,7 @@ SetMotorDuty(uint32_t ui32Out, uint32_t ui32Bit, float fPct)
         return;
     }
 
-    // % duty -> pulse width in PWM clocks (e.g. 99% of 4000 = 3960)
+    // % duty -> pulse width in PWM clocks (e.g. 50% of 4000 = 2000)
     uint32_t ui32Width = (uint32_t)((float)PWMPeriod * fPct / 100.0f);
     if(ui32Width < 1) ui32Width = 1;    // width 0 is not allowed
 
@@ -238,18 +297,34 @@ SetMotorDuty(uint32_t ui32Out, uint32_t ui32Bit, float fPct)
     PWMOutputState(PWM0_BASE, ui32Bit, true);
 }
 
-// LAB 6 ADDITION: set both motors -- left = PB6 (PWM_OUT_0), right = PB7 (PWM_OUT_1)
+// Set both motors -- left = PB6 (PWM_OUT_0), right = PB7 (PWM_OUT_1).
+// Trim is added only when a wheel is moving, so 0% still means off.
 void
 SetMotors(float fLeftPct, float fRightPct)
 {
+    if(fLeftPct  > 0.0f) fLeftPct  += LEFT_TRIM_PCT;
+    if(fRightPct > 0.0f) fRightPct += RIGHT_TRIM_PCT;
     SetMotorDuty(PWM_OUT_0, PWM_OUT_0_BIT, fLeftPct);
     SetMotorDuty(PWM_OUT_1, PWM_OUT_1_BIT, fRightPct);
 }
 
 //*****************************************************************************
-// LAB 6 ADDITION
-// [MOTOR] PWM_init (task 2): Lab 4 PWM setup moved from the LED (PF1) to the
-// motor driver pins. Outputs stay OFF until STR.
+// [MOTOR] Set each wheel's direction: true = forward, false = reverse.
+// Handles the mirrored right motor so callers just think forward/reverse.
+//*****************************************************************************
+void
+SetDirection(bool bLeftFwd, bool bRightFwd)
+{
+    uint8_t ui8Left  = bLeftFwd  ? LEFT_PHASE_FWD  : !LEFT_PHASE_FWD;
+    uint8_t ui8Right = bRightFwd ? RIGHT_PHASE_FWD : !RIGHT_PHASE_FWD;
+
+    GPIOPinWrite(GPIO_PORTA_BASE, GPIO_PIN_2 | GPIO_PIN_3,
+                 (ui8Left  ? GPIO_PIN_2 : 0) |
+                 (ui8Right ? GPIO_PIN_3 : 0));
+}
+
+//*****************************************************************************
+// [MOTOR] PWM_init: motor driver pins. Outputs stay OFF until STR.
 //*****************************************************************************
 void
 PWM_init(void)
@@ -270,9 +345,7 @@ PWM_init(void)
 
     // Direction pins: PA2 (left), PA3 (right) as GPIO outputs, set to forward
     GPIOPinTypeGPIOOutput(GPIO_PORTA_BASE, GPIO_PIN_2 | GPIO_PIN_3);
-    GPIOPinWrite(GPIO_PORTA_BASE, GPIO_PIN_2 | GPIO_PIN_3,
-                 (LEFT_PHASE_FWD  ? GPIO_PIN_2 : 0) |
-                 (RIGHT_PHASE_FWD ? GPIO_PIN_3 : 0));
+    SetDirection(true, true);
 
     // Generator 0 drives PWM_OUT_0 and PWM_OUT_1: count-down mode, 10 kHz
     PWMPeriod = SysCtlClockGet() / PWM_FREQ_HZ;
@@ -285,9 +358,8 @@ PWM_init(void)
 }
 
 //*****************************************************************************
-// LAB 6 ADDITION
-// [TIMER] Timer_init (task 5): Timer 2A, periodic, 50 ms.
-// Load = 40 MHz / 1000 x 50 - 1 = 1,999,999. Enabled by STR, disabled by STP.
+// [TIMER] Timer_init: Timer 2A, periodic, SAMPLE_PERIOD_MS.
+// Load = 40 MHz / 1000 x 30 - 1 = 1,199,999. Enabled in main and left on.
 //*****************************************************************************
 void
 Timer_init(void)
@@ -304,22 +376,21 @@ Timer_init(void)
 }
 
 //*****************************************************************************
-// LAB 6 ADDITION
-// [ISR] Timer 2A, every 50 ms: trigger the sensor reading (task 6).
-// Replaces the Lab 5 ADCProcessorTrigger() + SysCtlDelay() in main's loop.
+// [ISR] Timer 2A: trigger the FRONT sensor. The front ISR decides whether
+// the right sensor gets read.
 //*****************************************************************************
 void
 Timer2AIntHandler(void)
 {
     TimerIntClear(TIMER2_BASE, TIMER_TIMA_TIMEOUT);
-    ADCProcessorTrigger(ADC0_BASE, ADC_SEQ);
+    TickCount++;                        // LIVE: main() uses this to time the printouts
+    ADCProcessorTrigger(ADC0_BASE, ADC_SEQ_FRONT);
 }
 
 //*****************************************************************************
-// [ADC] ADC_init (task 4)
-// LAB 5 -> LAB 6 EDIT: Lab 5 took 4 samples of the right sensor only. Now
-// SS1 takes 2 samples of each sensor (right = CH0, front = CH1), with 4x
-// hardware oversampling to reduce noise.
+// [ADC] ADC_init
+//   SS2 = front (CH1), 2 samples, triggered by the timer
+//   SS1 = right (CH0), 2 samples, triggered by the front ISR
 //*****************************************************************************
 void
 ADC_init(void)
@@ -332,16 +403,24 @@ ADC_init(void)
     GPIOPinTypeADC(GPIO_PORTE_BASE, GPIO_PIN_3 | GPIO_PIN_2);   // PE3 right, PE2 front
     ADCHardwareOversampleConfigure(ADC0_BASE, 4);               // each sample = average of 4
 
-    ADCSequenceDisable(ADC0_BASE, ADC_SEQ);                     // disable while configuring
-    ADCSequenceConfigure(ADC0_BASE, ADC_SEQ, ADC_TRIGGER_PROCESSOR, 0);
-    ADCSequenceStepConfigure(ADC0_BASE, ADC_SEQ, 0, ADC_CTL_CH0);      // right
-    ADCSequenceStepConfigure(ADC0_BASE, ADC_SEQ, 1, ADC_CTL_CH0);      // right
-    ADCSequenceStepConfigure(ADC0_BASE, ADC_SEQ, 2, ADC_CTL_CH1);      // front
-    ADCSequenceStepConfigure(ADC0_BASE, ADC_SEQ, 3, ADC_CTL_IE | ADC_CTL_END | ADC_CTL_CH1);  // front, last step, interrupt
-    ADCSequenceEnable(ADC0_BASE, ADC_SEQ);
+    // Front sensor: SS2, priority 0
+    ADCSequenceDisable(ADC0_BASE, ADC_SEQ_FRONT);
+    ADCSequenceConfigure(ADC0_BASE, ADC_SEQ_FRONT, ADC_TRIGGER_PROCESSOR, 0);
+    ADCSequenceStepConfigure(ADC0_BASE, ADC_SEQ_FRONT, 0, ADC_CTL_CH1);
+    ADCSequenceStepConfigure(ADC0_BASE, ADC_SEQ_FRONT, 1, ADC_CTL_IE | ADC_CTL_END | ADC_CTL_CH1);
+    ADCSequenceEnable(ADC0_BASE, ADC_SEQ_FRONT);
+    ADCIntClear(ADC0_BASE, ADC_SEQ_FRONT);
+    ADCIntEnable(ADC0_BASE, ADC_SEQ_FRONT);
+    IntEnable(INT_ADC0SS2);
 
-    ADCIntClear(ADC0_BASE, ADC_SEQ);
-    ADCIntEnable(ADC0_BASE, ADC_SEQ);
+    // Right sensor: SS1, priority 1
+    ADCSequenceDisable(ADC0_BASE, ADC_SEQ_RIGHT);
+    ADCSequenceConfigure(ADC0_BASE, ADC_SEQ_RIGHT, ADC_TRIGGER_PROCESSOR, 1);
+    ADCSequenceStepConfigure(ADC0_BASE, ADC_SEQ_RIGHT, 0, ADC_CTL_CH0);
+    ADCSequenceStepConfigure(ADC0_BASE, ADC_SEQ_RIGHT, 1, ADC_CTL_IE | ADC_CTL_END | ADC_CTL_CH0);
+    ADCSequenceEnable(ADC0_BASE, ADC_SEQ_RIGHT);
+    ADCIntClear(ADC0_BASE, ADC_SEQ_RIGHT);
+    ADCIntEnable(ADC0_BASE, ADC_SEQ_RIGHT);
     IntEnable(INT_ADC0SS1);
 }
 
@@ -356,50 +435,59 @@ AdcToCm(uint32_t ui32Adc)
 }
 
 //*****************************************************************************
-// [LED] Task 7.1
-// LAB 5 -> LAB 6 EDIT: the color now shows how far the wheel is from the
-// 10 cm target (|error|), not the raw distance to the wall.
+// PidReset -- clear all PID memory so the next PID call starts fresh.
+// Called on STR, at the end of a U-turn and at the end of a right turn, so
+// old errors from before the turn don't cause a swerve afterwards.
+// (PidFirst also refills the D history on the next PID call.)
 //*****************************************************************************
 void
-SetLed(float fError)
+PidReset(void)
 {
-    float fAbs = (fError < 0.0f) ? -fError : fError;
-
-    if(fAbs <= GREEN_BAND_CM)       GPIOPinWrite(GPIO_PORTF_BASE, LED_ALL, LED_GREEN);
-    else if(fAbs <= YELLOW_BAND_CM) GPIOPinWrite(GPIO_PORTF_BASE, LED_ALL, LED_YELLOW);
-    else                            GPIOPinWrite(GPIO_PORTF_BASE, LED_ALL, LED_RED);
+    ErrSum   = 0.0f;
+    ErrPrev  = 0.0f;
+    AdjPrev  = 0.0f;
+    PidFirst = true;
 }
 
 //*****************************************************************************
-// [ISR] ADC0 SS1 -- sensor data ready (task 7)
-// LAB 5 -> LAB 6 EDIT: reads both sensors, converts to the right wheel
-// distance, then (while running) sets the LED and runs the PID.
+// [PID] Step 2: all PID code moved here from the Lab 6 ADC ISR. GREEN LED.
+// filter -> P (with deadband) + D (over 150 ms) -> clamp -> ramp -> motors
 //*****************************************************************************
 void
-ADC0Seq1IntHandler(void)
+PID(float fWheel)
 {
-    uint32_t ui32Value[ADC_NUM_SAMPLES];
-    float    fWheel, fErr, fAdj;
+    float   fRaw, fErr, fOld, fAdj;
+    uint8_t k;
 
-    ADCIntClear(ADC0_BASE, ADC_SEQ);
-    ADCSequenceDataGet(ADC0_BASE, ADC_SEQ, ui32Value);
+    GPIOPinWrite(GPIO_PORTF_BASE, LED_ALL, LED_GREEN);
 
-    // Average the 2 samples of each sensor, convert to cm
-    RightDistanceCm = AdcToCm((ui32Value[0] + ui32Value[1]) / 2);
-    FrontDistanceCm = AdcToCm((ui32Value[2] + ui32Value[3]) / 2);
+    // Low-pass filter: each reading moves FiltWheel only part of the way
+    // toward the new value, so single noisy readings barely matter.
+    if(PidFirst) FiltWheel = fWheel;    // first call after a reset: start at the real value
+    else         FiltWheel += FILTER_ALPHA * (fWheel - FiltWheel);
 
-    // 7.1: distance from the right WHEEL to the wall
-    fWheel = RightDistanceCm - SENSOR_TO_WHEEL_CM;
-    if(fWheel < 0.0f) fWheel = 0.0f;
-    RightWheelCm = fWheel;
+    fRaw = TARGET_CM - FiltWheel;       // > 0 too close, < 0 too far
 
-    if(!Running) return;                // stopped: leave LED and motors off
+    // TUNE: first call after a reset -- fill the history so D starts at 0
+    if(PidFirst)
+    {
+        for(k = 0; k < D_WINDOW; k++) ErrHist[k] = fRaw;
+        HistIdx  = 0;
+        PidFirst = false;
+    }
 
-    fErr = TARGET_CM - fWheel;          // > 0 too close, < 0 too far
-    SetLed(fErr);
+    // TUNE: D compares with the error from D_WINDOW readings ago (150 ms),
+    // so slow drifts toward/away from the wall are big enough to matter.
+    // Uses the error before the deadband, so D stays smooth.
+    fOld = ErrHist[HistIdx];
+    ErrHist[HistIdx] = fRaw;
+    HistIdx = (HistIdx + 1) % D_WINDOW;
 
-    // 7.2: PID (W6C1 slide 14)
-    fAdj = (KP * fErr) + (KD * (fErr - ErrPrev)) + (KI * ErrSum);
+    // Deadband (P and I only): close enough counts as perfect
+    fErr = fRaw;
+    if((fErr < DEADBAND_CM) && (fErr > -DEADBAND_CM)) fErr = 0.0f;
+
+    fAdj = (KP * fErr) + (KD * (fRaw - fOld)) + (KI * ErrSum);
 
     ErrSum += fErr;
     if(ErrSum >  I_SUM_LIMIT) ErrSum =  I_SUM_LIMIT;    // anti-windup
@@ -409,59 +497,233 @@ ADC0Seq1IntHandler(void)
     if(fAdj >  MAX_ADJUST_PCT) fAdj =  MAX_ADJUST_PCT;
     if(fAdj < -MAX_ADJUST_PCT) fAdj = -MAX_ADJUST_PCT;
 
-    // Add to one wheel, subtract from the other:
-    //   too close -> left slower -> turn away from the wall
-    //   too far   -> right slower -> turn toward the wall
-    // At 99% base speed the faster wheel stays clamped at 99%.
+    // Ramp: the correction can only change MAX_STEP_PCT per reading
+    if(fAdj > AdjPrev + MAX_STEP_PCT) fAdj = AdjPrev + MAX_STEP_PCT;
+    if(fAdj < AdjPrev - MAX_STEP_PCT) fAdj = AdjPrev - MAX_STEP_PCT;
+    AdjPrev = fAdj;
+
+    // too close -> left slower -> turn away from the wall
+    // too far   -> right slower -> turn toward the wall
     SetMotors(BASE_DUTY_PCT - fAdj, BASE_DUTY_PCT + fAdj);
 }
 
 //*****************************************************************************
+// [TURN] Step 3: Right Turn -- both wheels forward, left faster. BLUE LED.
+// Tune RTURN_LEFT_PCT / RTURN_RIGHT_PCT so the arc fits the maze.
+//*****************************************************************************
+void
+RightTurn(void)
+{
+    GPIOPinWrite(GPIO_PORTF_BASE, LED_ALL, LED_BLUE);
+    SetDirection(true, true);
+    SetMotors(RTURN_LEFT_PCT, RTURN_RIGHT_PCT);
+}
+
+//*****************************************************************************
+// [TURN] Step 4: U-Turn -- spin in place, left wheel reverse, right wheel
+// forward (turns left). RED LED. Only sets direction + speed; does NOT check
+// the front distance. Swap the two booleans to spin the other way.
+//*****************************************************************************
+void
+UTurn(void)
+{
+    GPIOPinWrite(GPIO_PORTF_BASE, LED_ALL, LED_RED);
+    SetDirection(false, true);
+    SetMotors(UTURN_PCT, UTURN_PCT);
+}
+
+//*****************************************************************************
+// [ISR] Step 5: ADC0 SS2 -- FRONT sensor ready (every 30 ms from Timer 2A)
+//*****************************************************************************
+void
+ADC0Seq2IntHandler(void)
+{
+    uint32_t ui32Value[4];
+
+    ADCIntClear(ADC0_BASE, ADC_SEQ_FRONT);
+    ADCSequenceDataGet(ADC0_BASE, ADC_SEQ_FRONT, ui32Value);
+
+    // Calculate the front distance
+    FrontDistanceCm = AdcToCm((ui32Value[0] + ui32Value[1]) / SAMPLES_PER_SENSOR);
+
+    if(!Running)
+    {
+        ADCProcessorTrigger(ADC0_BASE, ADC_SEQ_RIGHT);  // stopped: still read the right sensor for DST/LIV
+        return;
+    }
+
+    if(FrontDistanceCm < FRONT_STOP_CM)
+    {
+        // Wall ahead: stop, set U-turn status, start the U-turn
+        if(UTurnStatus == 0) SetMotors(0.0f, 0.0f);
+        UTurnStatus = 1;
+        UTurn();
+    }
+    else if((UTurnStatus == 1) && (FrontDistanceCm < UTURN_EXIT_CM))
+    {
+        // Still facing the wall: keep spinning
+        UTurn();
+    }
+    else if(UTurnStatus == 1)
+    {
+        // U-turn finished: both wheels forward at the default speed
+        SetDirection(true, true);
+        SetMotors(BASE_DUTY_PCT, BASE_DUTY_PCT);
+        UTurnStatus     = 0;
+        RightTurnStatus = 0;
+        FarCount        = 0;
+        PidReset();                     // fresh PID after the U-turn
+    }
+    else
+    {
+        // Path ahead is clear: read the right sensor
+        ADCProcessorTrigger(ADC0_BASE, ADC_SEQ_RIGHT);
+    }
+}
+
+//*****************************************************************************
+// [ISR] ADC0 SS1 -- RIGHT sensor ready (triggered by the front ISR)
+// Only calculates the distance and picks Right Turn or PID.
+//*****************************************************************************
+void
+ADC0Seq1IntHandler(void)
+{
+    uint32_t ui32Value[4];
+    float    fWheel;
+
+    ADCIntClear(ADC0_BASE, ADC_SEQ_RIGHT);
+    ADCSequenceDataGet(ADC0_BASE, ADC_SEQ_RIGHT, ui32Value);
+
+    // Calculate the right side distance, then wheel-to-wall
+    RightDistanceCm = AdcToCm((ui32Value[0] + ui32Value[1]) / SAMPLES_PER_SENSOR);
+    fWheel = RightDistanceCm - SENSOR_TO_WHEEL_CM;
+    if(fWheel < 0.0f) fWheel = 0.0f;
+    RightWheelCm = fWheel;
+
+    if(!Running || UTurnStatus) return;
+
+    // Count far readings in a row, so one noisy spike can't start a turn
+    if(fWheel > INTERSECTION_CM)
+    {
+        if(FarCount < 255) FarCount++;
+    }
+    else
+    {
+        FarCount = 0;
+    }
+
+    if(FarCount >= INTERSECTION_COUNT)
+    {
+        // No wall on the right: intersection -> turn right
+        RightTurnStatus = 1;
+        RightTurn();
+    }
+    else
+    {
+        // Wall found again after a turn: restart the PID cleanly
+        if(RightTurnStatus)
+        {
+            RightTurnStatus = 0;
+            PidReset();
+        }
+        PID(fWheel);
+    }
+}
+
+//*****************************************************************************
 // [COMMANDS] Lab 3 command interpreter
-// LAB 5 -> LAB 6 EDIT: FWD/BCK/LFT/RGT removed, STR added, STP now stops
-// the robot, DST now prints the wheel distance.
 //*****************************************************************************
 
-// STR: reset the PID, motors at full speed (task 3), start the timer (task 5)
+// STR: reset PID + turn flags, both wheels forward, start driving
 void
 CmdStart(void)
 {
-    ErrSum  = 0.0f;
-    ErrPrev = 0.0f;
-    Running = true;
+    PidReset();
+    UTurnStatus     = 0;
+    RightTurnStatus = 0;
+    FarCount        = 0;
+    SetDirection(true, true);
     SetMotors(BASE_DUTY_PCT, BASE_DUTY_PCT);
-    TimerEnable(TIMER2_BASE, TIMER_A);
-    UARTSendBoth("\r\nSTR: Start -- following the right wall\r\n");
-    
+    Running = true;
+    UARTSendBoth("\r\nSTR: Start -- navigating the maze\r\n");
 }
 
-// STP: timer off, motors off, LED off
+// STP: clear Running first so a pending ADC ISR can't restart the motors.
+// The timer keeps running so DST/LIV still show live readings.
 void
 CmdStop(void)
 {
-    TimerDisable(TIMER2_BASE, TIMER_A);
     Running = false;
     SetMotors(0.0f, 0.0f);
+    SetDirection(true, true);
+    UTurnStatus     = 0;
+    RightTurnStatus = 0;
+    FarCount        = 0;
     GPIOPinWrite(GPIO_PORTF_BASE, LED_ALL, 0);
     UARTSendBoth("\r\nSTP: Stop the robot\r\n");
 }
 
-// DST: print the right wheel distance in whole cm.
-// Note: readings only happen while the timer runs (after STR).
+// Add a whole number to the end of a string (rounded to nearest)
 void
-CmdDistance(void)
+AppendCm(char *Msg, float fCm)
 {
-    char     Msg[48] = "\r\nDST: Wheel = ";
     char     Num[6];
-    uint32_t v = (uint32_t)(RightWheelCm + 0.5f);   // round to nearest cm
+    uint32_t v = (uint32_t)(fCm + 0.5f);
     int      n = 0, len = strlen(Msg);
 
-    // Number -> text: digits come out in reverse, then copied back in order
+    // Digits come out in reverse, then copied back in order
     do { Num[n++] = '0' + (v % 10); v /= 10; } while(v > 0);
     while(n > 0) Msg[len++] = Num[--n];
     Msg[len] = '\0';
+}
+
+// DST: print the right wheel and front distances in whole cm (one time)
+void
+CmdDistance(void)
+{
+    char Msg[64] = "\r\nDST: Wheel = ";
+
+    AppendCm(Msg, RightWheelCm);
+    strcat(Msg, " cm, Front = ");
+    AppendCm(Msg, FrontDistanceCm);
     strcat(Msg, " cm\r\n");
     UARTSendBoth(Msg);
+}
+
+//*****************************************************************************
+// LIVE: print one line with both sensors and the current mode.
+// Called from main() only (UARTSendBoth blocks, so never from an ISR).
+//   Wheel = right wheel to wall, Right = right sensor to wall,
+//   Front = front sensor to wall, Mode = STOP / PID / RTURN / UTURN
+//*****************************************************************************
+void
+PrintLive(void)
+{
+    char Msg[96] = "\r\nLIVE: Wheel = ";
+
+    AppendCm(Msg, RightWheelCm);
+    strcat(Msg, " cm, Right = ");
+    AppendCm(Msg, RightDistanceCm);
+    strcat(Msg, " cm, Front = ");
+    AppendCm(Msg, FrontDistanceCm);
+    strcat(Msg, " cm, Mode = ");
+
+    if(!Running)              strcat(Msg, "STOP");
+    else if(UTurnStatus)      strcat(Msg, "UTURN");
+    else if(RightTurnStatus)  strcat(Msg, "RTURN");
+    else                      strcat(Msg, "PID");
+
+    UARTSendBoth(Msg);
+}
+
+// LIVE: LIV turns the live readout on/off
+void
+CmdLive(void)
+{
+    Streaming = !Streaming;
+    TickCount = 0;
+    UARTSendBoth(Streaming ? "\r\nLIV: live readout ON (type LIV to stop)\r\n"
+                           : "\r\nLIV: live readout OFF\r\n");
 }
 
 // Prototype: the table needs CmdHelp's address before it is defined
@@ -472,6 +734,7 @@ const Command CmdTable[] =
     { "STR", CmdStart    },
     { "STP", CmdStop     },
     { "DST", CmdDistance },
+    { "LIV", CmdLive     },
     { "HLP", CmdHelp     }
 };
 #define NUM_COMMANDS (sizeof(CmdTable) / sizeof(CmdTable[0]))
@@ -479,18 +742,12 @@ const Command CmdTable[] =
 void
 CmdHelp(void)
 {
-    UARTSendBoth("\r\nCommands: STR = start, STP = stop, DST = wheel distance, HLP = help\r\n");
+    UARTSendBoth("\r\nCommands: STR = start, STP = stop, DST = distances, LIV = live readout on/off, HLP = help\r\n");
 }
 
 //*****************************************************************************
 //
 // [MAIN] Setup, then run Bluetooth commands forever.
-//
-// LAB 5 -> LAB 6 changes:
-//   NEW:     PWM_init(), Timer_init()
-//   CHANGED: while(1) no longer triggers the ADC or waits with SysCtlDelay();
-//            Timer 2A triggers the ADC and the ADC ISR runs the LED + PID
-//   CHANGED: startup prompt (Lab 5 clear-screen code removed)
 //
 //*****************************************************************************
 int
@@ -498,7 +755,7 @@ main(void)
 {
     uint32_t i;
 
-    // FPU on before any float math (distance formula + PID in the ADC ISR)
+    // FPU on before any float math (distance formula + PID in the ADC ISRs)
     ROM_FPUEnable();
     ROM_FPULazyStackingEnable();
 
@@ -537,19 +794,36 @@ main(void)
     ROM_IntEnable(INT_UART1);
     ROM_UARTIntEnable(UART1_BASE, UART_INT_RX | UART_INT_RT);
 
-    ADC_init();         // task 4: right + front sensors
+    ADC_init();         // front (SS2) + right (SS1) sensors
+    PWM_init();         // motor PWM, outputs off until STR
+    Timer_init();       // 30 ms timer
 
-    // ===================== LAB 6 ADDITION =====================
-    PWM_init();         // task 2: motor PWM, outputs off until STR
-    Timer_init();       // task 5: 50 ms timer, started by STR
-    // ===================== LAB 6 ADDITION END =================
+#if TEST_MODE == 0
+    TimerEnable(TIMER2_BASE, TIMER_A);  // sensors always update; STR/STP only start/stop the motors
+#endif
 
-    UARTSendBoth("Lab 6: type STR to start, STP to stop, HLP for help\r\n");
+    UARTSendBoth("Lab 7: STR = start, STP = stop, DST = distances, LIV = live readout, HLP = help\r\n");
 
-    // LAB 5 -> LAB 6 EDIT: ADC trigger + 50 ms delay removed from this loop,
-    // so commands (especially STP) are handled immediately.
     while(1)
     {
+        // ===================== TEST HOOK (steps 3, 4 + trim) =====================
+#if TEST_MODE == 1
+        RightTurn();                    // should drive in a circle (open area)
+#elif TEST_MODE == 2
+        UTurn();                        // should spin in place
+#elif TEST_MODE == 3
+        SetDirection(true, true);       // both wheels same duty -> should go straight
+        SetMotors(BASE_DUTY_PCT, BASE_DUTY_PCT);
+#endif
+        // =========================================================================
+
+        // LIVE: print a readout every STREAM_PERIOD_MS while LIV is on
+        if(Streaming && (TickCount >= STREAM_TICKS))
+        {
+            TickCount = 0;
+            PrintLive();
+        }
+
         if(CmdReady)
         {
             char Cmd[CMD_LEN + 1];

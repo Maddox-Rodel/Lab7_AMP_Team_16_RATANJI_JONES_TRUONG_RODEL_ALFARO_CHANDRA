@@ -53,15 +53,16 @@ extern uint32_t __STACK_TOP;
 
 //*****************************************************************************
 //
-// External declaration for the interrupt handler used by the application.
+// External declaration for the interrupt handlers used by the application.
 //
 //*****************************************************************************
 extern void UART0IntHandler(void);         // UART0 (Tera Term) receive ISR
 extern void UART1IntHandler(void);         // UART1 (Bluetooth) receive ISR
-extern void ADC0Seq1IntHandler(void);      // Lab 5: ADC0 SS1 done -> both distance sensors (+ Lab 6 PID)
-// ===================== LAB 6 ADDITION =====================
-extern void Timer2AIntHandler(void);       // 50 ms periodic timer -> triggers the ADC
-// ===================== LAB 6 ADDITION END =================
+extern void ADC0Seq1IntHandler(void);      // ADC0 SS1 done -> RIGHT sensor -> Right Turn or PID
+// ===================== LAB 7 ADDITION =====================
+extern void ADC0Seq2IntHandler(void);      // ADC0 SS2 done -> FRONT sensor -> U-turn logic
+// ===================== LAB 7 ADDITION END =================
+extern void Timer2AIntHandler(void);       // 50 ms periodic timer -> triggers the FRONT sensor
 
 //*****************************************************************************
 //
@@ -105,15 +106,15 @@ void (* const g_pfnVectors[])(void) =
     IntDefaultHandler,                      // PWM Generator 2
     IntDefaultHandler,                      // Quadrature Encoder 0
     IntDefaultHandler,                      // ADC Sequence 0
-    ADC0Seq1IntHandler,                     // ADC Sequence 1  (Lab 5: distance sensors)
-    IntDefaultHandler,                      // ADC Sequence 2
+    ADC0Seq1IntHandler,                     // ADC Sequence 1  (RIGHT sensor)
+    ADC0Seq2IntHandler,                     // ADC Sequence 2  (LAB 7 ADDITION: FRONT sensor)
     IntDefaultHandler,                      // ADC Sequence 3
     IntDefaultHandler,                      // Watchdog timer
     IntDefaultHandler,                      // Timer 0 subtimer A
     IntDefaultHandler,                      // Timer 0 subtimer B
     IntDefaultHandler,                      // Timer 1 subtimer A
     IntDefaultHandler,                      // Timer 1 subtimer B
-    Timer2AIntHandler,                      // Timer 2 subtimer A  (LAB 6 ADDITION: 50 ms timer)
+    Timer2AIntHandler,                      // Timer 2 subtimer A  (50 ms timer)
     IntDefaultHandler,                      // Timer 2 subtimer B
     IntDefaultHandler,                      // Analog Comparator 0
     IntDefaultHandler,                      // Analog Comparator 1
