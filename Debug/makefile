@@ -15,7 +15,7 @@ ORDERED_OBJS += \
 "../uart_echo_ccs.cmd" \
 $(GEN_CMDS__FLAG) \
 -llibc.a \
--l"C:/ti/TivaWare_C_Series-2.1.4.178/driverlib/ccs/Debug/driverlib.lib" \
+-l"C:/ti/TivaWare_C_Series-2.1.3.156/driverlib/ccs/Debug/driverlib.lib" \
 
 -include ../makefile.init
 

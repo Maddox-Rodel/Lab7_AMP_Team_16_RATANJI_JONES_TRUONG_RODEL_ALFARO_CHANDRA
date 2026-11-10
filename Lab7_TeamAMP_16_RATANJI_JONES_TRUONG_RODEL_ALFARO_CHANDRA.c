@@ -113,7 +113,7 @@ __error__(char *pcFilename, uint32_t ui32Line)
 // [WALL] Distances (all in cm) -- tune these in the maze
 //   wheel distance = right sensor distance - SENSOR_TO_WHEEL_CM
 //*****************************************************************************
-#define TARGET_CM           10.0f   // right wheel 10 cm from the wall
+#define TARGET_CM           7.0f   // right wheel 10 cm from the wall
 #define SENSOR_TO_WHEEL_CM  0.0f    // sensor is at the edge of the wheel
 #define INTERSECTION_CM     15.0f   // wheel-to-wall above this = opening -> right turn
 #define INTERSECTION_COUNT  2       // far readings in a row needed before starting the turn
@@ -160,9 +160,9 @@ __error__(char *pcFilename, uint32_t ui32Line)
 #define UTURN_PCT           50.0f   // U-turn: both wheels, opposite directions
 
 // TURN: timing of the right-turn sequence (ms)
-#define RTURN_DELAY_BEFORE_MS  500  // TURN: straight past the opening before turning
-#define RTURN_TURN_MS          800  // TURN: pivot time -- tune until it turns 90 degrees
-#define RTURN_DELAY_AFTER_MS   500  // TURN: straight after turning, right sensor ignored
+#define RTURN_DELAY_BEFORE_MS  1100  // TURN: straight past the opening before turning
+#define RTURN_TURN_MS          850  // TURN: pivot time -- tune until it turns 90 degrees
+#define RTURN_DELAY_AFTER_MS   1100  // TURN: straight after turning, right sensor ignored
 
 #define LEFT_PHASE_FWD      0       // PA2 level for forward
 #define RIGHT_PHASE_FWD     1       // PA3 level for forward (right motor is mirrored)
@@ -836,7 +836,7 @@ CmdHelp(void)
 //*****************************************************************************
 int
 main(void)
- c{
+{
     uint32_t i;
 
     // FPU on before any float math (distance formula + PID in the ADC ISRs)

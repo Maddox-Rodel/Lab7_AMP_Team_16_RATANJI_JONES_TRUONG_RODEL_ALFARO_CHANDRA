@@ -5,7 +5,7 @@
 <stringAttribute key="com.ti.ccstudio.debug.debugModel.ATTR_PROGRAM.Stellaris In-Circuit Debug Interface_0/CORTEX_M4_0" value="${build_artifact:Lab7_TeamAMP_16_RATANJI_JONES_TRUONG_RODEL_ALFARO_CHANDRA}"/>
 <stringAttribute key="com.ti.ccstudio.debug.debugModel.ATTR_PROJECT.Stellaris In-Circuit Debug Interface_0/CORTEX_M4_0" value="Lab7_TeamAMP_16_RATANJI_JONES_TRUONG_RODEL_ALFARO_CHANDRA"/>
 <stringAttribute key="com.ti.ccstudio.debug.debugModel.ATTR_TARGET_CONFIG" value="${target_config_active_default:Lab7_TeamAMP_16_RATANJI_JONES_TRUONG_RODEL_ALFARO_CHANDRA}"/>
-<stringAttribute key="com.ti.ccstudio.debug.debugModel.MRU_PROGRAM.Stellaris In-Circuit Debug Interface_0/CORTEX_M4_0" value="C:/Tiva_C\Lab7_TeamAMP_16_RATANJI_JONES_TRUONG_RODEL_ALFARO_CHANDRA\Debug\Lab7_TeamAMP_16_RATANJI_JONES_TRUONG_RODEL_ALFARO_CHANDRA.out"/>
+<stringAttribute key="com.ti.ccstudio.debug.debugModel.MRU_PROGRAM.Stellaris In-Circuit Debug Interface_0/CORTEX_M4_0" value="C:/Users\Maddo\OneDrive\Documents\School\Embedded\Lab7_TeamAMP_16_RATANJI_JONES_TRUONG_RODEL_ALFARO_CHANDRA\Debug\Lab7_TeamAMP_16_RATANJI_JONES_TRUONG_RODEL_ALFARO_CHANDRA.out"/>
 <listAttribute key="org.eclipse.debug.core.MAPPED_RESOURCE_PATHS">
 <listEntry value="/Lab7_TeamAMP_16_RATANJI_JONES_TRUONG_RODEL_ALFARO_CHANDRA"/>
 </listAttribute>
